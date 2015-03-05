@@ -9,7 +9,6 @@ import requests
 import redis
 from urlparse import urlparse
 import json
-import stats
 
 logger = logging.getLogger(__name__)
 
@@ -78,21 +77,43 @@ def scale_tasks(marathon, num_tasks):
 
 
 def get_scale_down_candidates(redis_conn, namespace, lang):
-    keyname = "%s:stt:%s:idle" % (namespace, lang)
+    keyname = "%s:stt:tok:%s:idle" % (namespace, lang)
     candidates = redis_conn.smembers(keyname)
-    return candidates
+    if not candidates:
+        return []
+    return list(candidates)
 
 
-def remove_candidates(marathon, candidates, redis_conn, namespace, lang):
+def clear_idle_workers(redis_conn, namespace, lang):
+    keyname = "%s:stt:tok:%s:idle" % (namespace, lang)
+    redis_conn.delete(keyname)
+
+
+def get_active_deployments(marathon):
+    cancel_r = requests.get("%s/v2/apps/tokenizer/english/" % marathon)
+    if cancel_r.status_code == 200:
+        deployments = cancel_r.json()['app']['deployments']
+        return deployments
+
+
+def remove_candidates(marathon, candidates, num_to_kill, redis_conn, namespace, lang):
+    headers = {'Content-type': 'application/json'}
+    deployments = get_active_deployments(marathon)
+    if deployments:
+        for deployment in deployments:
+            requests.delete("%s/v2/deployments/%s?force=true" % (marathon, deployment['id']))
     infos = list()
+    killed = 0
     for candidate in candidates:
-        headers = {'Content-type': 'application/json'}
         r = requests.delete("%s/v2/apps/tokenizer/english/tasks/%s?scale=true" % (marathon, candidate),
                             headers=headers)
         if r.status_code == 200:
-            keyname = "%s:stt:%s:idle" % (namespace, lang)
-            redis_conn.srem(keyname, candidate)
             infos.append(r.json())
+            killed += 1
+        keyname = "%s:stt:tok:%s:idle" % (namespace, lang)
+        redis_conn.srem(keyname, candidate)
+        if num_to_kill == killed:
+            break
     return infos
 
 
@@ -107,12 +128,12 @@ def main():
     # statsd connection
     statsd_server = urlparse(args.statsd_server)
     statsd_port = statsd_server.port if statsd_server.port is not None else 31990
-    statsd_conn = stats.set_statsd(statsd_server.hostname, statsd_port)
+    statsd_conn = set_statsd(statsd_server.hostname, statsd_port)
 
     t_proc_len = get_proc_length(redis_conn, args.namespace, args.lang)
     t_num_workers = get_marathon_workers(args.marathon_server)
 
-    err_high_water_mark = t_proc_len - t_num_workers
+    err_high_water_mark = max(t_proc_len - t_num_workers, 0)
     iters_idle = 0
     while True:
         # Get queue lengths
@@ -136,40 +157,98 @@ def main():
             scale_up = True
             scale_up_to = min(args.max_workers, in_len)
             if num_workers < scale_up_to:
-                msg = scale_tasks(args.marathon_server, scale_up_to)
-                print "SCALING UP TO %s" % str(scale_up_to)
-                print msg
+                if not get_active_deployments(args.marathon_server):
+                    msg = scale_tasks(args.marathon_server, scale_up_to)
+                    print "SCALING UP TO %s" % str(scale_up_to)
+                    print msg
+                else:
+                    print "ALREADY IN AN ACTIVE DEPLOYMENT"
 
         if (proc_len - err_high_water_mark) > num_workers:
             err_high_water_mark += (proc_len - err_high_water_mark)
 
         # push metrics to statsd
         true_proc_len = proc_len - err_high_water_mark
-        stats.gauge('english.in', in_len)
-        stats.gauge('english.proc', true_proc_len)
-        stats.gauge('english.err', err_high_water_mark)
-        stats.gauge('english.done', done_len)
-        stats.gauge('english.workers', num_workers)
+        gauge('english.in', in_len)
+        gauge('english.proc', true_proc_len)
+        gauge('english.err', err_high_water_mark)
+        gauge('english.done', done_len)
+        gauge('english.workers', num_workers)
+
         # Scale down logic
         scale_down = False
         if (proc_len - err_high_water_mark) < num_workers:
             iters_idle += 1
-            if iters_idle >= int(60 / args.poll):
+            if iters_idle >= int(25 / args.poll):
                 scale_down = True
         else:
             iters_idle = 0
 
         if scale_down and not scale_up:
             scale_down_to = proc_len - err_high_water_mark
+            num_to_kill = num_workers - scale_down_to
             if scale_down_to < num_workers:
                 print "REQUESTING SCALE DOWN TO %s" % scale_down_to
                 candidates = get_scale_down_candidates(redis_conn, args.namespace, args.lang)
-                msgs = remove_candidates(args.marathon, candidates[:scale_down_to])
-                print "SCALING DOWN TO %s" % str(len(msgs))
-                print msgs
-
+                msgs = remove_candidates(args.marathon_server, candidates, num_to_kill, redis_conn,
+                                         args.namespace, args.lang)
+                print "SCALED DOWN %s" % str(len(msgs))
+                if msgs:
+                    print msgs
+        clear_idle_workers(redis_conn, args.namespace, args.lang)
         print
         time.sleep(args.poll)
+
+
+_statsd = None
+logger = logging.getLogger(__name__)
+
+
+def set_statsd(statsd_server, statsd_port=8125):
+    try:
+        import statsd
+    except ImportError:
+        logger.warn('statsd not installed. Cannot aggregate statistics')
+        return
+
+    global _statsd
+    port = statsd_port
+    server = statsd_server.split(':', 1)
+    hostname = server[0]
+    if len(server) == 2:
+        port = int(server[1])
+    try:
+        _statsd = statsd.StatsClient(hostname, port, prefix='redis-q')
+    except Exception, e:
+        logger.error(str(e))
+        return
+    logger.debug("Aggregating statistics to {0}:{1}".format(hostname, port))
+
+
+statsd_server_env = 'KLUGE_STATSD_SERVER'
+if statsd_server_env in os.environ:
+    set_statsd(os.environ[statsd_server_env])
+
+
+def incr(stat, count=1, rate=1):
+    if _statsd:
+        _statsd.incr(stat, count=count, rate=rate)
+
+
+def decr(stat, count=1, rate=1):
+    if _statsd:
+        _statsd.decr(stat, count=count, rate=rate)
+
+
+def timing(stat, delta, rate=1):
+    if _statsd:
+        _statsd.timing(stat, delta, rate=rate)
+
+
+def gauge(stat, value, rate=1, delta=False):
+    if _statsd:
+        _statsd.gauge(stat, value, rate=rate, delta=delta)
+
 
 if __name__ == '__main__':
     main()
