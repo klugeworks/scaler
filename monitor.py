@@ -60,10 +60,10 @@ def get_done_length(redis_conn, namespace, lang):
 
 
 def get_marathon_workers(marathon):
-    r = requests.get(marathon + "/v2/apps/tokenizer/english/tasks")
+    r = requests.get(marathon + "/v2/apps/tokenizer/english")
     if r.status_code == 200:
         info = r.json()
-        return len(info['tasks'])
+        return int(info['app']['tasksRunning'])
 
 
 def scale_tasks(marathon, num_tasks):
